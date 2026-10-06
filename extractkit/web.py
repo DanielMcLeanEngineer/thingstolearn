@@ -1,14 +1,39 @@
 """Extract links, headings, tables, metadata and text from a web page (standard library only)."""
+import json
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from urllib.error import HTTPError
+from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
+from urllib.robotparser import RobotFileParser
 
 SKIP_TAGS = {"script", "style", "noscript"}
 
 
-def fetch(url, timeout=15):
-    """Download a page and return its HTML as text."""
-    request = Request(url, headers={"User-Agent": "extractkit/1.0 (+learning project)"})
+USER_AGENT = "extractkit/1.0 (+learning project)"
+
+
+def robots_allows(url, robots_text):
+    """True if robots.txt content allows our user agent to fetch this URL."""
+    parser = RobotFileParser()
+    parser.parse(robots_text.splitlines())
+    return parser.can_fetch(USER_AGENT, url)
+
+
+def fetch(url, timeout=15, respect_robots=True):
+    """Download a page and return its HTML as text. Checks the site's robots.txt first by default."""
+    if respect_robots:
+        parts = urlsplit(url)
+        try:
+            robots = fetch(f"{parts.scheme}://{parts.netloc}/robots.txt", timeout, respect_robots=False)
+        except HTTPError as e:
+            if e.code in (401, 403):
+                raise ValueError(f"robots.txt denies access to {parts.netloc} (use --ignore-robots to override)")
+            robots = ""  # 404 etc.: no rules, so allowed
+        except OSError:
+            robots = ""  # robots.txt unreachable: fall through to the real request, which reports any error
+        if not robots_allows(url, robots):
+            raise ValueError(f"robots.txt disallows fetching {url} (use --ignore-robots to override)")
+    request = Request(url, headers={"User-Agent": USER_AGENT})
     with urlopen(request, timeout=timeout) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         return response.read().decode(charset, errors="replace")
@@ -24,7 +49,9 @@ class _PageParser(HTMLParser):
         self.images = []
         self.headings = []
         self.tables = []
+        self.jsonld = []
         self.text_parts = []
+        self._ld = None           # buffer while inside <script type="application/ld+json">
         self._stack = []          # currently open tags
         self._link = None         # [href, text parts]
         self._heading = None      # [tag, text parts]
@@ -35,7 +62,9 @@ class _PageParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         self._stack.append(tag)
-        if tag == "meta":
+        if tag == "script" and attrs.get("type") == "application/ld+json":
+            self._ld = []
+        elif tag == "meta":
             key = attrs.get("name") or attrs.get("property")
             if key and attrs.get("content"):
                 self.meta[key] = attrs["content"]
@@ -53,6 +82,12 @@ class _PageParser(HTMLParser):
             self._cell = []
 
     def handle_endtag(self, tag):
+        if tag == "script" and self._ld is not None:
+            try:
+                self.jsonld.append(json.loads("".join(self._ld)))
+            except ValueError:
+                pass  # malformed JSON-LD: ignore
+            self._ld = None
         if tag in self._stack:  # tolerate sloppy HTML
             while self._stack and self._stack.pop() != tag:
                 pass
@@ -75,6 +110,9 @@ class _PageParser(HTMLParser):
             self._table = None
 
     def handle_data(self, data):
+        if self._ld is not None:
+            self._ld.append(data)
+            return
         if any(t in SKIP_TAGS for t in self._stack):
             return
         if "title" in self._stack:
@@ -97,6 +135,7 @@ def parse_html(html, base_url=""):
         "links": parser.links,
         "images": parser.images,
         "tables": parser.tables,
+        "jsonld": parser.jsonld,
         "text": "\n".join(line for line in (" ".join(p.split()) for p in parser.text_parts) if line),
     }
 

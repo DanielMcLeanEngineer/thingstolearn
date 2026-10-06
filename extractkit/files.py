@@ -1,8 +1,10 @@
 """Extract information from local files: CSV profiles, nested JSON, log files and folder inventories."""
+import ast
 import csv
 import hashlib
 import json
 import re
+import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -86,11 +88,14 @@ def summarise_access_log(path, top=5):
     }
 
 
+SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv"}
+
+
 def inventory(folder, find_duplicates=True):
     """List every file in a folder tree with size and type, optionally flagging duplicate content."""
     files, by_hash = [], defaultdict(list)
     for p in sorted(Path(folder).rglob("*")):
-        if p.is_file():
+        if p.is_file() and not SKIP_DIRS.intersection(p.relative_to(folder).parts):
             size = p.stat().st_size
             files.append({"path": str(p), "extension": p.suffix.lower() or "(none)", "bytes": size})
             if find_duplicates and size:
@@ -103,3 +108,50 @@ def inventory(folder, find_duplicates=True):
         "by_extension": dict(by_type.most_common()),
         "duplicates": [group for group in by_hash.values() if len(group) > 1],
     }
+
+
+def outline_python(path):
+    """List the classes, functions and methods in a Python file, with line numbers and docstring summaries."""
+    source = Path(path).read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        raise ValueError(f"{path} is not valid Python: {e}")
+    rows = []
+
+    def visit(node, parent=""):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                kind = "class" if isinstance(child, ast.ClassDef) else ("method" if parent else "function")
+                args = "" if kind == "class" else ", ".join(a.arg for a in child.args.args)
+                doc = (ast.get_docstring(child) or "").split("\n")[0]
+                rows.append({"line": child.lineno, "kind": kind, "name": f"{parent}{child.name}",
+                             "args": args, "doc": doc})
+                if kind == "class":
+                    visit(child, f"{child.name}.")
+            else:
+                visit(child, parent)
+
+    visit(tree)
+    return rows
+
+
+def sqlite_schema(path):
+    """One row per column of every table in a SQLite database, with row counts. Opened read-only."""
+    if not Path(path).is_file():
+        raise ValueError(f"No such database: {path}")
+    quote = lambda name: '"' + name.replace('"', '""') + '"'
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        rows = []
+        for t in tables:
+            count = conn.execute(f"SELECT COUNT(*) FROM {quote(t)}").fetchone()[0]
+            for _, col, ctype, notnull, _, pk in conn.execute(f"PRAGMA table_info({quote(t)})"):
+                rows.append({"table": t, "rows": count, "column": col, "type": ctype,
+                             "not_null": bool(notnull), "primary_key": bool(pk)})
+        return rows
+    except sqlite3.DatabaseError as e:
+        raise ValueError(f"{path} is not a readable SQLite database: {e}")
+    finally:
+        conn.close()

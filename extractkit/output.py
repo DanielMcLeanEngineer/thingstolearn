@@ -12,6 +12,7 @@ def write_csv(rows, file):
     """Write a list of dicts as CSV to an open file."""
     rows = list(rows)
     if not rows:
+        print("No rows found.", file=sys.stderr)
         return
     fieldnames = list(dict.fromkeys(k for row in rows for k in row))
     writer = csv.DictWriter(file, fieldnames=fieldnames)
